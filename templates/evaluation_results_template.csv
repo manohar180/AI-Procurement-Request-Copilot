@@ -1,1 +1,33 @@
-case_id,architecture,correct_next_action,grounded_evidence,policy_followed,human_escalation_correct,latency_ms,llm_calls,tool_calls,notes
+case_id,request_id,architecture,passed_minimum_checks,correct_next_action,grounded_evidence,policy_followed,human_escalation_correct,latency_ms,llm_calls,tool_calls,notes
+PUB-01,REQ-1001,single,True,True,True,True,True,333.7,0,4,All checks satisfied
+PUB-02,REQ-1002,single,True,True,True,True,True,77.5,0,4,All checks satisfied
+PUB-03,REQ-1003,single,True,True,True,True,True,62.6,0,4,All checks satisfied
+PUB-04,REQ-1005,single,True,True,True,True,True,65.3,0,4,All checks satisfied
+PUB-05,REQ-1006,single,True,True,True,True,True,77.0,0,4,All checks satisfied
+PUB-06,REQ-1009,single,True,True,True,True,True,77.9,0,4,All checks satisfied
+EXT-01,REQ-EXT-01,single,True,True,True,True,True,79.2,0,4,All checks satisfied
+EXT-02,REQ-EXT-02,single,True,True,True,True,True,64.0,0,4,All checks satisfied
+EXT-03,REQ-EXT-03,single,True,True,True,True,True,64.3,0,4,All checks satisfied
+EXT-04,REQ-EXT-04,single,True,True,True,True,True,64.3,0,4,All checks satisfied
+EXT-05,REQ-EXT-05,single,True,True,True,True,True,90.1,0,4,All checks satisfied
+EXT-06,REQ-EXT-06,single,True,True,True,True,True,64.7,0,4,All checks satisfied
+EXT-07,REQ-EXT-07,single,True,True,True,True,True,65.2,0,4,All checks satisfied
+EXT-08,REQ-EXT-08,single,True,True,True,True,True,62.3,0,4,All checks satisfied
+EXT-09,REQ-EXT-09,single,True,True,True,True,True,61.4,0,4,All checks satisfied
+EXT-10,REQ-EXT-10,single,True,True,True,True,True,65.6,0,4,All checks satisfied
+PUB-01,REQ-1001,staged,True,True,True,True,True,75.3,0,4,All checks satisfied
+PUB-02,REQ-1002,staged,True,True,True,True,True,78.4,0,4,All checks satisfied
+PUB-03,REQ-1003,staged,True,True,True,True,True,67.7,0,4,All checks satisfied
+PUB-04,REQ-1005,staged,True,True,True,True,True,87.5,0,4,All checks satisfied
+PUB-05,REQ-1006,staged,True,True,True,True,True,62.2,0,4,All checks satisfied
+PUB-06,REQ-1009,staged,True,True,True,True,True,64.5,0,4,All checks satisfied
+EXT-01,REQ-EXT-01,staged,True,True,True,True,True,63.9,0,4,All checks satisfied
+EXT-02,REQ-EXT-02,staged,True,True,True,True,True,61.5,0,4,All checks satisfied
+EXT-03,REQ-EXT-03,staged,True,True,True,True,True,79.7,0,4,All checks satisfied
+EXT-04,REQ-EXT-04,staged,True,True,True,True,True,62.3,0,4,All checks satisfied
+EXT-05,REQ-EXT-05,staged,True,True,True,True,True,78.5,0,4,All checks satisfied
+EXT-06,REQ-EXT-06,staged,True,True,True,True,True,63.3,0,4,All checks satisfied
+EXT-07,REQ-EXT-07,staged,True,True,True,True,True,62.2,0,4,All checks satisfied
+EXT-08,REQ-EXT-08,staged,True,True,True,True,True,65.3,0,4,All checks satisfied
+EXT-09,REQ-EXT-09,staged,True,True,True,True,True,62.9,0,4,All checks satisfied
+EXT-10,REQ-EXT-10,staged,True,True,True,True,True,81.1,0,4,All checks satisfied

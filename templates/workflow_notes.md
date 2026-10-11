@@ -42,7 +42,7 @@
                                  v
                +----------------------------------+
                |   Human Approver Review Gate     |
-               +----------------------------------+
+               +-----------------+----------------+
 ```
 
 ### Architecture B: Staged / Two-Agent Variant
@@ -92,7 +92,7 @@
                                  v
                +----------------------------------+
                |   Human Approver Review Gate     |
-               +----------------------------------+
+               +-----------------+----------------+
 ```
 
 ---
@@ -113,10 +113,10 @@
    - Flags discrepancies between internal registry and external assessment.
 4. **`ProcurementPolicyCheckerTool` (Deterministic Engine):**
    - Hard-coded procurement policy engine mapping spend to approval tiers:
-     - $\le \$1,000$: Manager
-     - $\$1,000.01 - \$10,000$: Department Head + Procurement
-     - $\$10,000.01 - \$25,000$: Department Head + Finance + Procurement
-     - $> \$25,000$: Department Head + Finance + CFO + Procurement
+     - <= $1,000: Manager
+     - $1,000.01 - $10,000: Department Head + Procurement
+     - $10,000.01 - $25,000: Department Head + Finance + Procurement
+     - > $25,000: Department Head + Finance + CFO + Procurement
    - Gating rules: Source code, production integrations, customer/employee PII, confidential documents, new vendors, and cross-region storage trigger mandatory Security, Privacy, and Legal approvals.
 
 ---

@@ -14,6 +14,9 @@ class RunTelemetry(BaseModel):
     llm_calls: int | None = None
     tool_calls: int | None = None
     tool_names: list[str] = Field(default_factory=list)
+    llm_fallback_used: bool = False
+    tokens_used: int | None = None
+    latency_ms: float | None = None
 
 
 class ProcurementDecision(BaseModel):
@@ -25,22 +28,11 @@ class ProcurementDecision(BaseModel):
     risk_flags: list[str] = Field(default_factory=list)
     next_step: str
     human_review_required: bool = True
+    review_level: str | None = Field(
+        default=None,
+        description="Categorized review tier: manager_sign_off, business_approval, specialist_review, escalation",
+    )
     telemetry: RunTelemetry | None = None
 
 
 Architecture = Literal["single", "staged"]
-
-# Suggested approval names for consistency in evaluation:
-# Manager, Department Head, Procurement, Finance, CFO, Security, Privacy, Legal
-#
-# Suggested risk-flag taxonomy (you may add others):
-# existing_tool_overlap
-# budget_insufficient
-# security_review_required
-# privacy_review_required
-# legal_review_required
-# vendor_review_expired
-# conflicting_vendor_evidence
-# vendor_risk_unavailable
-# prompt_injection_detected
-# missing_information

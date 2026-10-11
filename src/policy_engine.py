@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+import unicodedata
+from datetime import date
 from typing import Any
 from pydantic import BaseModel, Field
 
@@ -11,16 +12,25 @@ REFERENCE_DATE = date(2026, 9, 30)
 MAX_ASSESSMENT_AGE_DAYS = 365
 
 INJECTION_PATTERNS = [
-    r"ignore\s+(all\s+)?(procurement\s+)?rules",
-    r"ignore\s+previous\s+instructions",
-    r"treat\s+this\s+request\s+as\s+.*approved",
-    r"approve\s+(it\s+)?immediately",
-    r"cfo-approved",
-    r"bypass\s+(all\s+)?(approvals?|policy|controls?)",
-    r"system\s+prompt",
-    r"disregard\s+(policy|rules|security)",
-    r"override\s+(policy|procurement|rules)",
+    r"\b(ignore|forget|disregard|skip|bypass)\b.*\b(rules|instructions|guidelines|policy|controls|checks|reviews?|approvals?)\b",
+    r"\b(cfo[_\s-]?approved|pre[_\s-]?approved|already[_\s-]?approved|treat\s+this\s+request\s+as\s+.*approved)\b",
+    r"\b(approve\s+(it|this)?\s*immediately|auto[_\s-]?approve)\b",
+    r"\b(system\s+prompt|developer\s+mode|jailbreak|reveal\s+.*prompt)\b",
+    r"\b(you\s+are\s+now|act\s+as\b)",
+    r"\b(override\s+(policy|procurement|rules|controls))\b",
+    r"\b(disregard\s+(policy|rules|security|guidelines))\b",
+    r"\b(skip\s+(security|finance|legal|procurement|approval|review))\b",
 ]
+
+SENSITIVE_DATA_KEYWORDS = {
+    "source_code",
+    "production_telemetry",
+    "confidential_documents",
+    "employee_pii",
+    "customer_pii",
+    "credentials",
+    "secrets",
+}
 
 
 class PolicyEvaluationResult(BaseModel):
@@ -29,17 +39,25 @@ class PolicyEvaluationResult(BaseModel):
     missing_information: list[str] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)
     human_review_required: bool = True
+    review_level: str = "business_approval"
     deterministic_recommendation: str = ""
     deterministic_next_step: str = ""
 
 
+def _normalize_text(text: str | None) -> str:
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", str(text))
+    return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
 def detect_prompt_injection(text: str | None) -> bool:
-    """Detect potential prompt injection or adversarial policy-bypass instructions in business data."""
+    """Detect prompt injection or adversarial policy-override directives in text."""
     if not text:
         return False
-    lowered = text.lower()
+    cleaned = _normalize_text(text)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, lowered):
+        if re.search(pattern, cleaned):
             return True
     return False
 
@@ -48,16 +66,47 @@ def parse_date(date_val: str | None) -> date | None:
     if not date_val:
         return None
     try:
-        return date.fromisoformat(str(date_val).strip())
-    except ValueError:
+        clean = str(date_val).strip()
+        if clean.lower() in ("nan", "none", "null", ""):
+            return None
+        return date.fromisoformat(clean)
+    except (ValueError, TypeError):
         return None
 
 
 def is_date_expired(review_date_str: str | None, reference_date: date = REFERENCE_DATE) -> bool:
+    """Check if review date is older than 365 days from reference date.
+    
+    Returns False if date is missing/None (missing is not expired; it is not completed).
+    Exactly 365 days is considered current per policy §5.
+    """
     d = parse_date(review_date_str)
     if not d:
-        return True
+        return False
     return (reference_date - d).days > MAX_ASSESSMENT_AGE_DAYS
+
+
+def _has_sensitive_data_access(data_access_level: str) -> tuple[bool, list[str]]:
+    norm = _normalize_text(data_access_level)
+    matched = []
+    for kw in SENSITIVE_DATA_KEYWORDS:
+        pattern = r"\b" + re.escape(kw.replace("_", " ")) + r"\b|\b" + re.escape(kw) + r"\b"
+        if re.search(pattern, norm):
+            matched.append(kw)
+    return bool(matched), matched
+
+
+def _has_sensitive_integrations(integrations: list[str]) -> tuple[bool, list[str]]:
+    matched = []
+    sensitive_integration_pattern = re.compile(
+        r"\b(git|github|gitlab|bitbucket|repository|repositories|production|cloud|aws|gcp|azure)\b",
+        re.IGNORECASE,
+    )
+    for item in integrations:
+        clean_item = _normalize_text(item)
+        if sensitive_integration_pattern.search(clean_item):
+            matched.append(item)
+    return bool(matched), matched
 
 
 def evaluate_procurement_policy(
@@ -73,24 +122,42 @@ def evaluate_procurement_policy(
     missing_info: list[str] = []
     evidence_items: list[EvidenceItem] = []
 
-    # 1. Untrusted content & prompt injection check
-    business_text_fields = [
-        request.get("business_justification", ""),
-        request.get("product_name", ""),
-        request.get("vendor_name", ""),
+    # 1. Untrusted content & prompt injection scanning across all available business text
+    business_text_sources = [
+        ("request.business_justification", request.get("business_justification")),
+        ("request.product_name", request.get("product_name")),
+        ("request.vendor_name", request.get("vendor_name")),
     ]
-    has_injection = any(detect_prompt_injection(txt) for txt in business_text_fields)
+    if vendor_info:
+        if vendor_info.get("registry_info"):
+            business_text_sources.append(("vendor.registry_notes", vendor_info["registry_info"].get("notes")))
+        if vendor_info.get("api_info"):
+            business_text_sources.append(("vendor.api_notes", vendor_info["api_info"].get("notes")))
+        if vendor_info.get("api_error_detail"):
+            business_text_sources.append(("vendor.api_error", vendor_info.get("api_error_detail")))
+
+    injection_findings = []
+    for source_label, text in business_text_sources:
+        if text and detect_prompt_injection(str(text)):
+            injection_findings.append((source_label, str(text)))
+
+    has_injection = bool(injection_findings)
     if has_injection:
         risk_flags.append("prompt_injection_detected")
+        src_labels = ", ".join(s for s, _ in injection_findings)
         evidence_items.append(
             EvidenceItem(
                 source="security_policy_filter",
-                finding="Untrusted request text contains policy-bypass/override attempt. Neutralized and flagged for human review.",
+                finding=f"Prompt injection / policy bypass attempt detected in business text ({src_labels}). Injected directive neutralized; evaluating actual procurement policy per policy §9.",
                 reference="procurement_policy.md:Section 9",
             )
         )
+        if "Security" not in approvals:
+            approvals.append("Security")
+        if "security_review_required" not in risk_flags:
+            risk_flags.append("security_review_required")
 
-    # 2. Required request information validation (Section 1)
+    # 2. Required request information validation (Policy §1)
     cost = request.get("annual_cost_usd")
     if cost is None:
         missing_info.append("annual cost")
@@ -98,7 +165,8 @@ def evaluate_procurement_policy(
     if user_count is None:
         missing_info.append("user count")
     data_access = request.get("data_access_level")
-    if not data_access or str(data_access).strip().lower() in ("unknown", "none_specified"):
+    norm_data_access = _normalize_text(data_access)
+    if not data_access or norm_data_access in ("unknown", "none_specified", "unspecified", ""):
         missing_info.append("data access level")
     if not request.get("business_justification"):
         missing_info.append("business purpose")
@@ -115,7 +183,7 @@ def evaluate_procurement_policy(
             )
         )
 
-    # 3. Budget Check (Section 2)
+    # 3. Budget Check (Policy §2)
     available_budget = budget_info.get("available_usd") if budget_info else None
     if cost is not None and available_budget is not None:
         if cost > available_budget:
@@ -138,84 +206,101 @@ def evaluate_procurement_policy(
                 )
             )
 
-    # 4. Financial Approval Thresholds (Section 4)
+    # 4. Financial Approval Thresholds (Policy §4)
+    # Grounding statement must accurately list only the threshold tier's own minimum approvals
+    tier_approvals: list[str] = []
     if cost is not None:
         if cost <= 1000.0:
-            if "Manager" not in approvals:
-                approvals.append("Manager")
+            tier_approvals = ["Manager"]
         elif cost <= 10000.0:
-            for role in ["Department Head", "Procurement"]:
-                if role not in approvals:
-                    approvals.append(role)
+            tier_approvals = ["Department Head", "Procurement"]
         elif cost <= 25000.0:
-            for role in ["Department Head", "Finance", "Procurement"]:
-                if role not in approvals:
-                    approvals.append(role)
+            tier_approvals = ["Department Head", "Finance", "Procurement"]
         else:
-            for role in ["Department Head", "Finance", "CFO", "Procurement"]:
-                if role not in approvals:
-                    approvals.append(role)
+            tier_approvals = ["Department Head", "Finance", "CFO", "Procurement"]
+
+        for role in tier_approvals:
+            if role not in approvals:
+                approvals.append(role)
+
         evidence_items.append(
             EvidenceItem(
                 source="financial_threshold_policy",
-                finding=f"Annual spend of ${cost:,.2f} maps to mandatory approval tier: {', '.join(approvals)}.",
+                finding=f"Annual spend of ${cost:,.2f} maps to financial threshold tier requiring: {', '.join(tier_approvals)} per policy §4.",
                 reference="procurement_policy.md:Section 4",
             )
         )
     else:
-        # Default baseline if cost missing
-        for role in ["Department Head", "Procurement"]:
+        # Cost is missing: baseline business review pending cost determination
+        tier_approvals = ["Department Head", "Procurement"]
+        for role in tier_approvals:
             if role not in approvals:
                 approvals.append(role)
 
-    # 5. Existing Software / Catalog Overlap (Section 3)
-    if catalog_overlap_info and catalog_overlap_info.get("has_overlap"):
-        risk_flags.append("existing_tool_overlap")
-        overlapping = catalog_overlap_info.get("overlapping_tools", [])
-        tool_names = [t.get("product_name", "Unknown") for t in overlapping]
-        evidence_items.append(
-            EvidenceItem(
-                source="software_catalog_check",
-                finding=f"Existing approved software identified with capability overlap: {', '.join(tool_names)}.",
-                reference="procurement_policy.md:Section 3",
-            )
-        )
+    # 5. Existing Software / Catalog Overlap (Policy §3)
+    is_expansion = False
+    if catalog_overlap_info:
+        is_expansion = catalog_overlap_info.get("is_expansion", False)
+        has_overlap = catalog_overlap_info.get("has_overlap", False)
 
-    # 6. Vendor & Security Assessment (Section 5, 8, 10)
-    data_access_level = str(request.get("data_access_level", "")).lower()
-    integrations = [str(i).lower() for i in request.get("requested_integrations", [])]
-    sensitive_data = any(
-        kw in data_access_level
-        for kw in ["source_code", "production", "confidential", "employee_pii", "customer_pii"]
-    )
-    sensitive_integrations = any(
-        any(kw in integ for kw in ["git", "code", "production", "cloud", "repository", "crm", "helpdeskly"])
-        for integ in integrations
-    )
+        if is_expansion:
+            tool_names = [t.get("product_name", "Unknown") for t in catalog_overlap_info.get("overlapping_tools", [])]
+            evidence_items.append(
+                EvidenceItem(
+                    source="software_catalog_check",
+                    finding=f"Request is an expansion/add-on extending existing approved catalog item(s): {', '.join(tool_names)}.",
+                    reference="procurement_policy.md:Section 3",
+                )
+            )
+        elif has_overlap:
+            risk_flags.append("existing_tool_overlap")
+            overlapping = catalog_overlap_info.get("overlapping_tools", [])
+            tool_names = [t.get("product_name", "Unknown") for t in overlapping]
+            evidence_items.append(
+                EvidenceItem(
+                    source="software_catalog_check",
+                    finding=f"Existing approved software identified with capability overlap: {', '.join(tool_names)}.",
+                    reference="procurement_policy.md:Section 3",
+                )
+            )
+
+    # 6. Vendor & Security Assessment (Policy §5, §8, §10)
+    data_access_level = str(request.get("data_access_level", ""))
+    integrations = request.get("requested_integrations", [])
+    has_sens_data, sens_data_types = _has_sensitive_data_access(data_access_level)
+    has_sens_int, sens_int_types = _has_sensitive_integrations(integrations)
 
     vendor_api_failed = vendor_info.get("api_available") is False if vendor_info else False
     vendor_expired = vendor_info.get("is_expired", False) if vendor_info else False
     vendor_conflict = vendor_info.get("has_conflict", False) if vendor_info else False
-    vendor_sec_status = vendor_info.get("security_status", "unknown") if vendor_info else "unknown"
+    vendor_sec_status = str(vendor_info.get("security_status", "unknown")).lower() if vendor_info else "unknown"
     vendor_new = vendor_info.get("is_new_vendor", False) if vendor_info else False
+    review_date_val = vendor_info.get("effective_review_date") if vendor_info else None
 
     security_needed = False
-    if sensitive_data or sensitive_integrations:
+    sec_reasons = []
+
+    if has_sens_data:
         security_needed = True
-    if vendor_sec_status != "approved" or vendor_expired or vendor_conflict or vendor_api_failed:
+        sec_reasons.append(f"sensitive data access ({', '.join(sens_data_types)})")
+    if has_sens_int:
         security_needed = True
+        sec_reasons.append(f"infrastructure integration ({', '.join(sens_int_types)})")
 
     if vendor_api_failed:
+        security_needed = True
         risk_flags.append("vendor_risk_unavailable")
         evidence_items.append(
             EvidenceItem(
                 source="vendor_risk_service",
-                finding="External vendor-risk API unavailable (503/network error). Live security assessment could not be retrieved.",
+                finding="External vendor-risk API unavailable (503/network error). Live security posture could not be verified.",
                 reference="procurement_policy.md:Section 10",
             )
         )
+        sec_reasons.append("vendor-risk service outage")
 
     if vendor_expired:
+        security_needed = True
         risk_flags.append("vendor_review_expired")
         evidence_items.append(
             EvidenceItem(
@@ -224,8 +309,21 @@ def evaluate_procurement_policy(
                 reference="procurement_policy.md:Section 5",
             )
         )
+        sec_reasons.append("expired security assessment")
+    elif not vendor_api_failed and (vendor_sec_status in ("not_completed", "pending", "unknown") or review_date_val is None):
+        if vendor_new or vendor_sec_status != "approved":
+            security_needed = True
+            sec_reasons.append(f"vendor security assessment not completed ({vendor_sec_status})")
+            evidence_items.append(
+                EvidenceItem(
+                    source="vendor_security_check",
+                    finding=f"Vendor security assessment is not completed (status: '{vendor_sec_status}', review date: {review_date_val or 'none'}).",
+                    reference="procurement_policy.md:Section 5",
+                )
+            )
 
     if vendor_conflict:
+        security_needed = True
         risk_flags.append("conflicting_vendor_evidence")
         evidence_items.append(
             EvidenceItem(
@@ -234,6 +332,7 @@ def evaluate_procurement_policy(
                 reference="procurement_policy.md:Section 5",
             )
         )
+        sec_reasons.append("conflicting vendor evidence")
 
     if security_needed:
         if "Security" not in approvals:
@@ -243,17 +342,28 @@ def evaluate_procurement_policy(
         evidence_items.append(
             EvidenceItem(
                 source="security_policy",
-                finding=f"Security review required (data: '{data_access_level}', integrations: {integrations}, vendor status: '{vendor_sec_status}').",
+                finding=f"Security review required per policy §5 due to: {'; '.join(sec_reasons)}.",
                 reference="procurement_policy.md:Section 5",
             )
         )
 
-    # 7. Privacy Review (Section 6)
-    processes_pii = any(kw in data_access_level for kw in ["employee_pii", "customer_pii"])
-    vendor_processes_personal = vendor_info.get("processes_personal_data", False) if vendor_info else False
+    # 7. Privacy Review (Policy §6)
+    # Triggered ONLY when tool processes employee/customer PII or sensitive data stored outside region
+    has_pii = any(k in sens_data_types for k in ["employee_pii", "customer_pii"])
     vendor_outside_region = vendor_info.get("stores_data_outside_region", False) if vendor_info else False
+    vendor_processes_personal = vendor_info.get("processes_personal_data", False) if vendor_info else False
 
-    if processes_pii or vendor_processes_personal or vendor_outside_region:
+    privacy_needed = False
+    privacy_reasons = []
+
+    if has_pii:
+        privacy_needed = True
+        privacy_reasons.append("processes employee or customer PII")
+    if vendor_outside_region and (has_pii or has_sens_data):
+        privacy_needed = True
+        privacy_reasons.append("sensitive data stored outside operating region")
+
+    if privacy_needed:
         if "Privacy" not in approvals:
             approvals.append("Privacy")
         if "privacy_review_required" not in risk_flags:
@@ -261,22 +371,36 @@ def evaluate_procurement_policy(
         evidence_items.append(
             EvidenceItem(
                 source="privacy_policy",
-                finding=f"Privacy review required (PII handling: {processes_pii or vendor_processes_personal}, cross-region storage: {vendor_outside_region}).",
+                finding=f"Privacy review required per policy §6 ({'; '.join(privacy_reasons)}).",
+                reference="procurement_policy.md:Section 6",
+            )
+        )
+    elif vendor_processes_personal:
+        evidence_items.append(
+            EvidenceItem(
+                source="privacy_policy",
+                finding="Vendor risk record indicates personal data capability, but requested scope does not process PII.",
                 reference="procurement_policy.md:Section 6",
             )
         )
 
-    # 8. Legal Review (Section 7)
-    legal_terms_status = vendor_info.get("legal_terms_status", "unknown").lower() if vendor_info else "unknown"
+    # 8. Legal Review (Policy §7)
+    legal_terms_status = str(vendor_info.get("legal_terms_status", "unknown")).lower() if vendor_info else "unknown"
     legal_needed = False
+    legal_reasons = []
+
     if vendor_new and (cost is None or cost >= 10000.0):
         legal_needed = True
+        legal_reasons.append(f"new vendor with annual spend >= $10,000 (${cost or 0:,.2f})")
     if legal_terms_status not in ("approved", "standard"):
         legal_needed = True
-    if vendor_api_failed and (cost is None or cost >= 10000.0 or sensitive_data):
+        legal_reasons.append(f"vendor legal terms status is '{legal_terms_status}' (not approved)")
+    if vendor_api_failed and (cost is None or cost >= 10000.0 or has_sens_data):
         legal_needed = True
-    if vendor_outside_region and (processes_pii or vendor_processes_personal):
+        legal_reasons.append("vendor risk assessment unavailable for material/sensitive purchase")
+    if vendor_outside_region and has_pii:
         legal_needed = True
+        legal_reasons.append("cross-border data processing terms require legal review")
 
     if legal_needed:
         if "Legal" not in approvals:
@@ -286,30 +410,77 @@ def evaluate_procurement_policy(
         evidence_items.append(
             EvidenceItem(
                 source="legal_policy",
-                finding=f"Legal review required (vendor: {'New' if vendor_new else 'Existing'}, spend: ${cost or 0:,.2f}, terms: '{legal_terms_status}').",
+                finding=f"Legal review required per policy §7 ({'; '.join(legal_reasons)}).",
                 reference="procurement_policy.md:Section 7",
             )
         )
 
-    # Deterministic recommendations & next steps
-    if has_injection:
-        rec = "Reject request and escalate prompt injection"
-        next_step = "Route request to Security and Procurement for adversarial review and policy enforcement."
-    elif missing_info:
-        rec = "Request clarification on missing information"
-        next_step = f"Request updated proposal from requester specifying missing fields ({', '.join(missing_info)})."
-    elif "budget_insufficient" in risk_flags:
-        rec = "Escalate for budget exception and multi-stakeholder review"
-        next_step = f"Route to {', '.join(approvals)} for formal exception review and vendor assessment."
-    elif "existing_tool_overlap" in risk_flags:
-        rec = "Evaluate existing catalog software before approving new purchase"
-        next_step = f"Engage requester to evaluate existing approved software ({', '.join(tool_names)}) or submit exception to {', '.join(approvals)}."
-    elif "security_review_required" in risk_flags or "vendor_risk_unavailable" in risk_flags:
-        rec = "Route for security and compliance review"
-        next_step = f"Submit security assessment ticket and route to {', '.join(approvals)} for formal evaluation."
+    # 9. AI Tools Rules (Policy §8)
+    cat_norm = _normalize_text(request.get("category", ""))
+    prod_norm = _normalize_text(request.get("product_name", ""))
+    is_ai_request = "ai" in cat_norm or "ai" in prod_norm or "neural" in prod_norm or "codemate" in prod_norm
+    if is_ai_request and has_sens_data:
+        evidence_items.append(
+            EvidenceItem(
+                source="ai_procurement_policy",
+                finding=f"AI product requested for sensitive data ({', '.join(sens_data_types)}). Prior vendor approval does not authorize sensitive data access; Security and Privacy review enforced per policy §8.",
+                reference="procurement_policy.md:Section 8",
+            )
+        )
+
+    # 10. Review Level Classification
+    if any(f in risk_flags for f in ("budget_insufficient", "vendor_risk_unavailable", "prompt_injection_detected", "conflicting_vendor_evidence")):
+        review_level = "escalation"
+    elif any(f in risk_flags for f in ("security_review_required", "privacy_review_required", "legal_review_required")):
+        review_level = "specialist_review"
+    elif any(a in approvals for a in ("Department Head", "Procurement")):
+        review_level = "business_approval"
     else:
-        rec = "Proceed with standard business approvals"
-        next_step = f"Route purchase request to {', '.join(approvals)} for sign-off."
+        review_level = "manager_sign_off"
+
+    # 11. Deterministic Recommendation & Next Step Synthesis (Prioritized & Combined)
+    if missing_info:
+        rec = f"Request clarification on missing information ({', '.join(missing_info)})"
+        next_step = f"Ask requester to clarify missing fields ({', '.join(missing_info)}) before routing to {', '.join(approvals)}."
+    elif "budget_insufficient" in risk_flags:
+        specialists = [a for a in ["Security", "Privacy", "Legal"] if a in approvals]
+        if specialists:
+            rec = f"Escalate for budget exception and specialist review ({', '.join(specialists)})"
+            next_step = f"Route to Finance for budget exception and {', '.join(specialists)} for compliance sign-off."
+        else:
+            rec = "Escalate for budget exception review with Finance"
+            next_step = f"Route to Finance and {', '.join(approvals)} for budget exception approval."
+    elif "vendor_risk_unavailable" in risk_flags:
+        rec = "Escalate to Security and Legal due to vendor-risk service outage"
+        next_step = f"Submit manual vendor risk assessment and route to {', '.join(approvals)}."
+    elif "conflicting_vendor_evidence" in risk_flags:
+        rec = "Escalate to Security for vendor record reconciliation"
+        next_step = f"Reconcile conflicting vendor records with Security before routing to {', '.join(approvals)}."
+    elif any(f in risk_flags for f in ("security_review_required", "privacy_review_required", "legal_review_required")):
+        specialists = [a for a in ["Security", "Privacy", "Legal"] if a in approvals]
+        if "existing_tool_overlap" in risk_flags:
+            rec = f"Evaluate existing catalog alternatives and route for specialist review ({', '.join(specialists)})"
+            next_step = f"Engage requester on existing alternatives and route to {', '.join(approvals)} for review."
+        else:
+            rec = f"Route for specialist compliance reviews ({', '.join(specialists)})"
+            next_step = f"Submit compliance review tickets and route to {', '.join(approvals)}."
+    elif "existing_tool_overlap" in risk_flags:
+        overlapping_tools = catalog_overlap_info.get("overlapping_tools", []) if catalog_overlap_info else []
+        tool_names = [t.get("product_name", "Unknown") for t in overlapping_tools]
+        rec = f"Evaluate existing catalog software ({', '.join(tool_names)}) before approving new purchase"
+        next_step = f"Engage requester to evaluate existing catalog software ({', '.join(tool_names)}) or submit exception to {', '.join(approvals)}."
+    else:
+        # Standard low-risk case
+        if approvals == ["Manager"]:
+            rec = "Proceed with manager approval"
+            next_step = "Route purchase request to Manager for standard approval."
+        else:
+            rec = f"Proceed with business approvals ({', '.join(approvals)})"
+            next_step = f"Route purchase request to {', '.join(approvals)} for standard sign-off."
+
+    if has_injection:
+        rec += " (prompt injection flagged for security review)"
+        next_step += " Alert Security of detected prompt injection directive."
 
     return PolicyEvaluationResult(
         required_approvals=approvals,
@@ -317,6 +488,7 @@ def evaluate_procurement_policy(
         missing_information=missing_info,
         evidence=evidence_items,
         human_review_required=True,
+        review_level=review_level,
         deterministic_recommendation=rec,
         deterministic_next_step=next_step,
     )
