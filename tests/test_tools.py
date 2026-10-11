@@ -52,6 +52,18 @@ class ToolsTests(unittest.TestCase):
         self.assertTrue(overlap_res["has_overlap"])
         self.assertFalse(overlap_res["is_expansion"])
 
+        # TaskFlow Pro: company-wide tool TaskFlow already exists with 180 seats; request is for 15 seats -> overlap per Policy §3
+        taskflow_res = tool.execute(product_name="TaskFlow Pro", category="Project Management", vendor_name="TaskFlow", user_count=15, telemetry=self.telemetry)
+        self.assertTrue(taskflow_res["has_overlap"])
+        self.assertFalse(taskflow_res["is_expansion"])
+        self.assertIn("TaskFlow", taskflow_res["evidence"][0].finding)
+        self.assertIn("180", taskflow_res["evidence"][0].finding)
+
+        # CodeMate Teams Expansion is a true add-on
+        codemate_res = tool.execute(product_name="CodeMate Teams Expansion", category="Developer AI", vendor_name="CodeMate", user_count=10, telemetry=self.telemetry)
+        self.assertTrue(codemate_res["is_expansion"])
+        self.assertFalse(codemate_res["has_overlap"])
+
     def test_vendor_security_lookup_approved(self):
         tool = VendorSecurityLookupTool()
         res = tool.execute("SignFlow", telemetry=self.telemetry)

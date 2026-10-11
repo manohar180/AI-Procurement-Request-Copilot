@@ -32,6 +32,12 @@ class ProcurementDecision(BaseModel):
         default=None,
         description="Categorized review tier: manager_sign_off, business_approval, specialist_review, escalation",
     )
+    recommendation_category: str | None = Field(
+        default=None,
+        description="Recommendation category: proceed, clarify, specialist_review, escalate, evaluate_alternatives",
+    )
+    rationale: str | None = Field(default=None, description="Detailed reasoning synthesizing evidence and policy")
+    clarifying_questions: list[str] = Field(default_factory=list, description="Clarifying questions if missing information exists")
     telemetry: RunTelemetry | None = None
 
 

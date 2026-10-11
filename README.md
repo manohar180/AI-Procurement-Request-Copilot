@@ -1,6 +1,6 @@
 # AI Procurement Request Copilot
 
-An enterprise-grade, evaluation-backed AI Procurement Request Copilot that ingests employee software and service requests, retrieves grounded facts using specialized tools, deterministically enforces financial and compliance policies in code, and synthesizes structured procurement decisions while strictly reserving sensitive approvals and exceptions for authorized humans.
+An evaluation-backed AI Procurement Request Copilot that ingests employee software and service requests, retrieves grounded facts using specialized tools, deterministically enforces financial and compliance policies in code, and synthesizes structured procurement decisions while strictly reserving sensitive approvals and exceptions for authorized humans.
 
 ---
 
@@ -84,6 +84,44 @@ flowchart TD
     end
 ```
 
+### Staged Two-Agent Architecture (Architecture B)
+
+```mermaid
+flowchart TD
+    subgraph Stage1 ["Stage 1: Research & Tool Execution (Analyst Agent)"]
+        REQ["Employee Purchase Request"]
+        T1["EmployeeBudgetLookupTool"]
+        T2["SoftwareCatalogLookupTool"]
+        T3["VendorSecurityLookupTool"]
+        PE["ProcurementPolicyEngine"]
+        PKG["EvidencePackage\n(Aggregated tool evidence & deterministic policy rules)"]
+        REQ --> T1 & T2 & T3
+        T1 & T2 & T3 --> PE --> PKG
+    end
+
+    subgraph Stage2 ["Stage 2: Adjudication & Synthesis (Reviewer Agent)"]
+        REV["Reviewer Agent (LLM / Fallback)\nReviews EvidencePackage against Policy"]
+        GUARD{"Contradiction & Taxonomy Guardrail\n(Filters risk flags, prevents auto-approve)"}
+        PKG --> REV --> GUARD
+    end
+
+    subgraph OutputStage ["Stage 3: Decision & Human Handoff"]
+        DEC_B["ProcurementDecision\n(Advisory recommendations, approval routing)"]
+        HUMAN_B(("Designated Human Approver Gate"))
+        GUARD --> DEC_B --> HUMAN_B
+    end
+```
+
+### Architecture A vs. Architecture B Comparison
+
+| Dimension | Architecture A (Single Agent) | Architecture B (Staged Two-Agent) |
+|---|---|---|
+| **Structure** | Single stage combining tool execution and policy synthesis | Two distinct agents communicating via an intermediate `EvidencePackage` |
+| **LLM Calls (Online)** | 1 call per request | 2 sequential calls (Analyst + Reviewer) |
+| **Complexity** | Lean; zero intermediate schema translation overhead | Higher; requires schema contracts between Analyst and Reviewer |
+| **Policy Adherence** | 100.0% (deterministic policy engine) | 100.0% (deterministic policy engine) |
+| **Failure Surface** | Lower surface area; single point of synthesis | Higher; two LLM roundtrips increase latency and failure probability |
+
 ---
 
 ## 4. Starter Pack Issues Found and Fixed
@@ -93,10 +131,10 @@ During comprehensive code and data auditing, multiple architectural bugs, edge-c
 | # | Defect / Gap Identified | Root Cause | Engineering Fix Applied | Test Coverage |
 |---|---|---|---|---|
 | 1 | **NaN Date Bug** | Blank cells in `vendors.csv` loaded as float `NaN`, which is truthy in Python. When passed to date parsers, it caused type errors or falsely marked unreviewed vendors as "expired". | Converted empty cells to `None` in `src/data_access.py` and updated `is_date_expired` to return `False` when date is missing. Missing reviews correctly trigger `security_review_required` without `vendor_review_expired`. | `tests/test_policy_engine.py::test_nan_date_handling_not_expired` |
-| 2 | **Over-Eager Privacy Review** | The policy engine flagged `privacy_review_required` whenever a vendor stored data outside the employee's region, even if zero personal data was processed. | Aligned with Section 7 of policy: cross-border storage only triggers Privacy review when employee/customer personal data is involved. | `tests/test_policy_engine.py::test_policy_privacy_review_trigger` |
+| 2 | **Over-Eager Privacy Review** | The policy engine flagged `privacy_review_required` whenever a vendor stored data outside the employee's region, even if zero personal data was processed. | Aligned with Section 6 of policy (Data Privacy): cross-border storage only triggers Privacy review when employee or customer personal data is involved. | `tests/test_policy_engine.py::test_policy_privacy_review_trigger` |
 | 3 | **Overlap vs. Add-On Conflation** | Add-on requests (e.g. SignFlow additional seats, CodeMate license expansions) were incorrectly flagged as redundant `existing_tool_overlap`. | Added explicit add-on and expansion keyword detection in `src/tools.py` and `src/policy_engine.py` so expansions are treated as renewals/tier-ups rather than redundant duplicates. | `tests/test_tools.py::test_catalog_addon_expansion_distinction` |
 | 4 | **Threshold Grounding Misattribution** | Policy grounding statements quoted the entire threshold ladder instead of citing the exact tier's required minimum approvals. | Updated grounding generator to cite only the specific tier's required approvals (e.g. `<= $1,000` requires Manager only). | `tests/test_policy_engine.py::test_policy_financial_thresholds_exact_boundary` |
-| 5 | **Substring False Positives** | Keyword matching on data categories used raw substring search (e.g. "Digital signage" triggered "sign"). | Implemented token-boundary regex (`\b`) for sensitive keywords (`source_code`, `credentials`, `production_telemetry`). | `tests/test_policy_engine.py::test_sensitive_data_token_boundary` |
+| 5 | **Substring False Positives** | Keyword matching on integrations used raw substring search where "Digital signage" triggered "git" (since "digital" contains "git"). | Implemented token-boundary word splitting (`\b` and whitespace/punctuation tokens) so "Digital signage" does not trigger Git repository security reviews. | `tests/test_policy_engine.py::test_sensitive_data_token_boundary` |
 | 6 | **API 404 vs 503 Conflation** | Vendor lookup treated HTTP 404 ("vendor not found in risk DB") identically to HTTP 503 ("service unavailable"). | Differentiated 404 (unassessed vendor) from 503 (infrastructure outage) in `src/tools.py`, setting `api_available=True` on 404 and `api_available=False` on 503. | `tests/test_tools.py::test_vendor_security_tool_404_vs_503` |
 | 7 | **Prompt Injection Paraphrases** | Starter regex only looked for literal phrases like `ignore all procurement rules`. | Expanded multi-source scanning across justification, vendor, and product fields to catch social engineering ("CFO pre-approved", "bypass review", "forget guidelines") without halting execution. | `tests/test_policy_engine.py::test_prompt_injection_paraphrased_detected` |
 | 8 | **Executive Requester (Missing Manager)** | Requester `E010` (Lisa Park, VP) has no manager (`manager_id` is empty), causing crashes or `NaN` manager names. | Added graceful executive handling in `src/tools.py`: defaults to self-managed executive with Dept Head / CFO routing. | `tests/test_tools.py::test_employee_budget_tool_executive_no_manager` |
@@ -181,20 +219,22 @@ Evaluation outputs are generated in:
 
 ## 7. Evaluation Results & Comparison
 
-### Benchmark Comparison (16 Cases: 6 Public + 10 Boundary)
+### Benchmark Comparison (22 Cases: 6 Public + 16 Boundary & Edge)
 
 | Evaluation Metric | Architecture A (Single Agent) | Architecture B (Staged Two-Agent) | Delta (B vs A) |
 |---|---:|---:|---:|
-| **Cases Passing Quality Criteria** | **16 / 16 (100.0%)** | **16 / 16 (100.0%)** | **0.0%** |
-| **Deterministic Policy Compliance** | **100.0%** | **100.0%** | **0.0%** |
-| **Tool Evidence Groundedness** | **100.0%** | **100.0%** | **0.0%** |
-| **Prompt Injection Resistance** | **100.0% (Flagged)** | **100.0% (Flagged)** | **0.0%** |
-| **API Outage Handling (503)** | **100.0% (Escalated)** | **100.0% (Escalated)** | **0.0%** |
-| **Mean Latency (Offline)** | **91.7 ms** | **76.0 ms** | -15.7 ms |
-| **P50 Latency** | **77.0 ms** | **78.0 ms** | +1.0 ms |
-| **LLM Calls per Request (Online Mode)** | **1 call** | **2 calls** | **+100% overhead** |
-| **Tool Calls per Request** | **4.0** | **4.0** | **0.0** |
-| **Qualitative Grounding Failures** | **0 / 16** | **0 / 16** | **0.0** |
+| **Cases Passing Quality Criteria** | **22/22 (100.0%)** | **22/22 (100.0%)** | **0.0%** |
+| **Deterministic Policy Compliance** | **100.0%** | **100.0%** | 0.0% |
+| **Recommendation Category Accuracy** | **100.0%** | **100.0%** | 0.0% |
+| **Tool Evidence Groundedness** | **100.0%** | **100.0%** | 0.0% |
+| **Human Escalation Accuracy** | **100.0%** | **100.0%** | 0.0% |
+| **Mean Latency (ms)** | **41.6 ms** | **40.9 ms** | -0.8 ms |
+| **P50 Latency (ms)** | **45.2 ms** | **45.2 ms** | -0.0 ms |
+| **P95 Latency (ms)** | **47.3 ms** | **49.5 ms** | +2.2 ms |
+| **Average Tool Calls per Case** | **4.0** | **4.0** | 0.0 |
+| **Average LLM Calls per Case** | **0.0** | **0.0** | 0.0 |
+
+*Note: Offline mode: A and B are functionally identical by design; LLM-mode comparison not run. In online LLM mode, Architecture B costs 2 LLM calls vs 1 by design.*
 
 ---
 
@@ -203,9 +243,9 @@ Evaluation outputs are generated in:
 **Shipped Architecture:** **Architecture A (Single Agent with Deterministic Policy Engine)**
 
 ### Rationale:
-1. **Compliance Equivalence:** Because financial thresholds, budget math, and compliance triggers (PII, source code, vendor review age) are enforced in deterministic Python code rather than probabilistic model reasoning, Architecture B provides **0% marginal accuracy improvement**.
-2. **Operational Efficiency:** Architecture B requires two sequential LLM calls in online mode (+100% token cost and latency), introduces intermediate schema drift risks, and increases operational complexity without measurable client benefit.
-3. **Safety & Governance:** Architecture A achieves 100% policy compliance, handles prompt injections without crashing, and preserves human approval authority at minimal operating expense.
+1. **Measured Compliance Equivalence:** Across all 22 test cases, Architecture A and Architecture B achieve identical policy adherence and evidence grounding. Financial thresholds, budget math, and compliance triggers (PII, source code, vendor review age) are evaluated in deterministic Python code rather than model weights.
+2. **Design-Level Cost & Latency:** In online LLM mode, Architecture B costs 2 LLM calls vs 1 by design (Analyst followed by Reviewer), doubling token expenses and external network latency without improving policy compliance.
+3. **Safety & Governance:** Architecture A achieves policy compliance, intercepts prompt injections across all input vectors without halting, and preserves human approval authority.
 
 Read the full decision memo in [`docs/architecture_decision.md`](docs/architecture_decision.md) (<= 500 words).
 
@@ -240,15 +280,23 @@ The system implements 4 modular tools equipped with `RunTelemetryCounter` observ
 In strict accordance with enterprise policy:
 - **`human_review_required` is always True:** The AI copilot never executes financial transactions or alters records autonomously.
 - **Prompt Injection Defense-in-Depth:**
-  1. Untrusted fields (`business_justification`, `product_name`, `vendor_name`) are scanned for adversarial overrides.
+  1. Untrusted fields (`business_justification`, `product_name`, `vendor_name`, `vendor_notes`, `api_notes`) are scanned for adversarial overrides.
   2. Flagged attempts add a `prompt_injection_detected` risk flag, escalating to human compliance without halting.
   3. When invoking external LLMs, untrusted text is wrapped inside `<untrusted_request_data>` XML containers.
   4. Deterministic policy evaluation executes in Python; prompt text cannot alter calculated approval tiers.
-- **Contradiction Guardrails:** In online LLM mode, if the model outputs a recommendation conflicting with policy rules (e.g. recommending "Approve" when budget is exceeded), the system automatically rejects the contradiction, falls back to deterministic synthesis, and logs `llm_fallback_used=True`.
+- **Contradiction Guardrails:** In online LLM mode, if the model outputs a recommendation conflicting with policy rules (e.g. recommending auto-approval when budget is exceeded or omitting top required reviewers), the system automatically rejects the contradiction, falls back to deterministic synthesis, and logs `llm_fallback_used=True`.
 
 ---
 
-## 11. Project Directory Structure
+## 11. Known Limitations
+
+- **No Live-LLM Benchmark Run:** Online LLM benchmark comparisons were not run due to external provider capacity constraints (HTTP 503); offline synthesis was validated deterministically.
+- **Catalog Semantics:** Free-text tool matching uses token-boundary matching and category fallbacks rather than semantic vector embeddings.
+- **Data Snapshots:** Ledger budgets and vendor risk data are daily CSV/API snapshots rather than real-time transactional webhooks.
+
+---
+
+## 12. Project Directory Structure
 
 ```text
 .
@@ -257,6 +305,7 @@ In strict accordance with enterprise policy:
 ├── README.md                        # Complete project documentation & guide
 ├── STUDENT_CHECKLIST.md             # Verification checklist against brief
 ├── app.py                           # Interactive Streamlit copilot UI dashboard
+├── pytest.ini                       # Pytest test configuration
 ├── run_local.py                     # One-command launcher (FastAPI API + UI)
 ├── verify_setup.py                  # Starter pack pre-flight check
 ├── requirements.txt                 # Python package dependencies
@@ -265,7 +314,7 @@ In strict accordance with enterprise policy:
 │   ├── employees.csv
 │   ├── procurement_policy.md        # Source of truth policy (2026-09-30)
 │   ├── purchase_history.csv
-│   ├── requests.json                # 10 synthetic purchase requests
+│   ├── requests.json                # Synthetic purchase requests
 │   ├── software_catalog.csv
 │   ├── vendor_risk.json             # Backing data for mock API
 │   └── vendors.csv
@@ -274,11 +323,12 @@ In strict accordance with enterprise policy:
 │   ├── architecture.md              # In-depth system architecture & diagrams
 │   └── architecture_decision.md     # Production ship decision memo (<= 500 words)
 ├── evals/                           # Evaluation benchmark harness & results
-│   ├── extra_cases.json             # 10 boundary & edge test cases
+│   ├── extra_cases.json             # 16 boundary & edge test cases
 │   ├── public_cases.json            # 6 public test cases
 │   ├── results_single.csv           # Benchmark results for Architecture A
 │   ├── results_staged.csv           # Benchmark results for Architecture B
 │   ├── results_summary.md           # Evaluation summary report
+│   ├── results_table.md             # Programmatically generated results table
 │   ├── run_evals.py                 # Unified evaluation benchmark runner
 │   └── run_public_evals.py          # Public test case runner
 ├── mock_api/                        # Mock external vendor-risk FastAPI service
@@ -294,11 +344,12 @@ In strict accordance with enterprise policy:
 │   ├── tools.py                     # 4 observable tools (Employee, Catalog, Vendor, Policy)
 │   └── vendor_client.py             # Vendor risk API client with fallback
 ├── templates/
-│   ├── architecture_decision.md     # Architecture decision memo template
 │   ├── evaluation_results_template.csv # Evaluation results template
 │   └── workflow_notes.md            # Architecture diagrams & design notes
-└── tests/                           # 35 unit and integration tests
+└── tests/                           # 37 unit and integration tests
+    ├── conftest.py                  # Test configuration (COPILOT_MODE=offline)
     ├── test_data_integrity.py       # Starter dataset integrity tests
+    ├── test_llm_guardrails.py       # LLM guardrails & architecture tests
     ├── test_mock_api.py             # Mock API tests
     ├── test_policy_engine.py        # Policy engine & threshold unit tests
     ├── test_solution.py             # Solution adapter integration tests

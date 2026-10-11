@@ -97,6 +97,8 @@ class LLMClient:
     def is_available(self) -> bool:
         if self.mock_handler:
             return True
+        if os.getenv("COPILOT_MODE", "").lower() == "offline":
+            return False
         return bool(
             os.getenv("GEMINI_API_KEY")
             or os.getenv("GOOGLE_API_KEY")
@@ -206,6 +208,68 @@ def _extract_json_block(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared LLM Guardrail Validator
+# ---------------------------------------------------------------------------
+
+ALLOWED_RISK_FLAGS = {
+    "existing_tool_overlap",
+    "budget_insufficient",
+    "security_review_required",
+    "privacy_review_required",
+    "legal_review_required",
+    "vendor_review_expired",
+    "conflicting_vendor_evidence",
+    "vendor_risk_unavailable",
+    "prompt_injection_detected",
+    "missing_information",
+}
+
+APPROVAL_GRANTING_TERMS = [
+    r"\bauto[-_\s]?approve\b",
+    r"\bno\s+approval\s+needed\b",
+    r"\bwaive(\s+\w+)?\s+review\b",
+    r"\bskip(\s+\w+)?\s+review\b",
+    r"\bproceed\s+to\s+purchase\b",
+    r"\bpre[-_\s]?approved\b",
+    r"\binstant\s+approval\b",
+    r"\bapprove\s+immediately\b",
+    r"\bapproved\s+without\s+review\b",
+]
+
+
+def validate_llm_recommendation(
+    llm_recommendation: str,
+    llm_rationale: str | None,
+    policy_res: PolicyEvaluationResult,
+) -> tuple[bool, str]:
+    """Validates LLM recommendation against deterministic policy results."""
+    rec_lower = (llm_recommendation or "").lower()
+    combined = f"{rec_lower} {(llm_rationale or '').lower()}"
+
+    # 1. Reject if recommendation contains approval-granting language while required approvals or flags exist
+    if policy_res.required_approvals or policy_res.risk_flags:
+        for pattern in APPROVAL_GRANTING_TERMS:
+            if re.search(pattern, rec_lower):
+                return False, f"LLM output contains unauthorized approval-granting phrase matching '{pattern}' while required approvals/flags exist."
+
+    # 2. Reject if it omits mention of top required reviewers in recommendation or rationale
+    top_reviewers = ["CFO", "Finance", "Security", "Privacy", "Legal"]
+    for reviewer in top_reviewers:
+        if reviewer in policy_res.required_approvals:
+            pattern = r"\b" + re.escape(reviewer.lower()) + r"\b"
+            if not re.search(pattern, combined):
+                return False, f"LLM output omitted mandatory mention of required reviewer '{reviewer}'."
+
+    # 3. Direct contradictions
+    if "budget_insufficient" in policy_res.risk_flags and ("within budget" in rec_lower or "budget sufficient" in rec_lower):
+        return False, "LLM claimed purchase was within budget when budget is insufficient."
+    if "missing_information" in policy_res.risk_flags and ("all information provided" in rec_lower or "complete request" in rec_lower):
+        return False, "LLM claimed request was complete when information is missing."
+
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
 # Shared Tool & Policy Layer for Both Architectures
 # ---------------------------------------------------------------------------
 
@@ -229,6 +293,7 @@ class BaseProcurementOrchestrator:
             product_name=request.get("product_name", ""),
             category=request.get("category", ""),
             vendor_name=request.get("vendor_name", ""),
+            user_count=request.get("user_count"),
             telemetry=telemetry,
         )
         ven_res = self.vendor_tool.execute(request.get("vendor_name", ""), telemetry=telemetry)
@@ -291,6 +356,8 @@ class SingleProcurementAgent(BaseProcurementOrchestrator):
         # Default to deterministic recommendation and next step
         recommendation = policy_res.deterministic_recommendation
         next_step = policy_res.deterministic_next_step
+        rationale: str | None = policy_res.deterministic_recommendation
+        clarifying_questions: list[str] = [f"Please clarify {m}" for m in policy_res.missing_information] if policy_res.missing_information else []
         llm_fallback_used = False
         total_tokens = 0
 
@@ -343,22 +410,19 @@ Provide a JSON object matching this schema:
                     parsed_json = json.loads(_extract_json_block(raw_text))
                     llm_obj = SingleAgentLLMResponse.model_validate(parsed_json)
 
-                    # Guardrail validation: Ensure LLM did not hallucinate auto-approval or contradict hard flags
-                    norm_rec = llm_obj.recommendation.lower()
-                    contradiction = False
-                    if policy_res.required_approvals and ("no approval needed" in norm_rec or "auto-approve" in norm_rec):
-                        contradiction = True
-                    if "budget_insufficient" in policy_res.risk_flags and "within budget" in norm_rec:
-                        contradiction = True
-                    if "missing_information" in policy_res.risk_flags and ("approve immediately" in norm_rec or "proceed to purchase" in norm_rec):
-                        contradiction = True
-
-                    if contradiction:
-                        logger.warning(f"LLM output contradicted deterministic policy: {llm_obj.recommendation}. Falling back.")
+                    # Guardrail validation: shared validator
+                    is_valid, reject_reason = validate_llm_recommendation(
+                        llm_obj.recommendation, llm_obj.rationale, policy_res
+                    )
+                    if not is_valid:
+                        logger.warning(f"SingleAgent LLM output rejected by guardrail: {reject_reason}. Falling back.")
                         llm_fallback_used = True
                     else:
                         recommendation = llm_obj.recommendation
                         next_step = llm_obj.next_step
+                        rationale = llm_obj.rationale
+                        if llm_obj.clarifying_questions:
+                            clarifying_questions = llm_obj.clarifying_questions
                 except Exception as exc:
                     logger.warning(f"Failed to parse or validate LLM response: {exc}. Using deterministic baseline.")
                     llm_fallback_used = True
@@ -377,6 +441,9 @@ Provide a JSON object matching this schema:
             next_step=next_step,
             human_review_required=policy_res.human_review_required,
             review_level=policy_res.review_level,
+            recommendation_category=policy_res.recommendation_category,
+            rationale=rationale,
+            clarifying_questions=clarifying_questions,
             telemetry=RunTelemetry(
                 llm_calls=telemetry.llm_calls,
                 tool_calls=telemetry.tool_calls,
@@ -475,6 +542,8 @@ Emit JSON matching this schema:
 
         recommendation = policy_res.deterministic_recommendation
         next_step = policy_res.deterministic_next_step
+        rationale: str | None = policy_res.deterministic_recommendation
+        clarifying_questions: list[str] = [f"Please clarify {m}" for m in policy_res.missing_information] if policy_res.missing_information else []
         final_risk_flags = list(policy_res.risk_flags)
 
         # =====================================================================
@@ -526,23 +595,22 @@ Emit JSON matching this schema:
                     parsed_json = json.loads(_extract_json_block(raw_text))
                     reviewer_obj = ReviewerLLMResponse.model_validate(parsed_json)
 
-                    # Guardrail: Check for contradictions
-                    norm_rec = reviewer_obj.recommendation.lower()
-                    contradiction = False
-                    if policy_res.required_approvals and ("no approval needed" in norm_rec or "auto-approve" in norm_rec):
-                        contradiction = True
-                    if "budget_insufficient" in policy_res.risk_flags and "within budget" in norm_rec:
-                        contradiction = True
-
-                    if contradiction:
-                        logger.warning(f"Agent 2 output contradicted policy: {reviewer_obj.recommendation}. Falling back.")
+                    # Guardrail: shared validator
+                    is_valid, reject_reason = validate_llm_recommendation(
+                        reviewer_obj.recommendation, reviewer_obj.rationale, policy_res
+                    )
+                    if not is_valid:
+                        logger.warning(f"Agent 2 output rejected by guardrail: {reject_reason}. Falling back.")
                         llm_fallback_used = True
                     else:
                         recommendation = reviewer_obj.recommendation
                         next_step = reviewer_obj.next_step
-                        # Agent 2 can add supplemental risk flags
+                        rationale = reviewer_obj.rationale
+                        if reviewer_obj.clarifying_questions:
+                            clarifying_questions = reviewer_obj.clarifying_questions
+                        # Validate additional_risk_flags against allowed taxonomy only
                         for extra_flag in reviewer_obj.additional_risk_flags:
-                            if extra_flag and extra_flag not in final_risk_flags:
+                            if extra_flag in ALLOWED_RISK_FLAGS and extra_flag not in final_risk_flags:
                                 final_risk_flags.append(extra_flag)
                 except Exception as exc:
                     logger.warning(f"Agent 2 parsing failed: {exc}. Falling back to deterministic baseline.")
@@ -562,6 +630,9 @@ Emit JSON matching this schema:
             next_step=next_step,
             human_review_required=policy_res.human_review_required,
             review_level=policy_res.review_level,
+            recommendation_category=policy_res.recommendation_category,
+            rationale=rationale,
+            clarifying_questions=clarifying_questions,
             telemetry=RunTelemetry(
                 llm_calls=telemetry.llm_calls,
                 tool_calls=telemetry.tool_calls,

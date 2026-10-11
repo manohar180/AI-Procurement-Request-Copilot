@@ -12,14 +12,17 @@ REFERENCE_DATE = date(2026, 9, 30)
 MAX_ASSESSMENT_AGE_DAYS = 365
 
 INJECTION_PATTERNS = [
-    r"\b(ignore|forget|disregard|skip|bypass)\b.*\b(rules|instructions|guidelines|policy|controls|checks|reviews?|approvals?)\b",
-    r"\b(cfo[_\s-]?approved|pre[_\s-]?approved|already[_\s-]?approved|treat\s+this\s+request\s+as\s+.*approved)\b",
-    r"\b(approve\s+(it|this)?\s*immediately|auto[_\s-]?approve)\b",
+    r"\b(ignore|forget|disregard|skip|bypass|waive|omit)\b.*\b(rules|instructions|guidelines|policy|controls|checks|reviews?|approvals?|directions)\b",
+    r"\b(pre[-_\s]?authorized|pre[-_\s]?approved|already[-_\s]?approved)(\s+by\s+[a-zA-Z_\s-]+)?\b",
+    r"\bno\s+need\s+for\s+(review|approval|security|checks|oversight)\b",
+    r"\b(skip|waive|omit)\s+(review|approval|security|checks|policy)\b",
+    r"\bdisregard\s+(prior|previous|above|all)?\s*(directions|instructions|rules|guidelines|policy)\b",
+    r"\b(i\s+order\s+you|you\s+must\s+approve|mark\s+(it\s+|this\s+)?approved)\b",
+    r"\bas\s+the\s+(ceo|cfo|director|vp|head\s+of\s+\w+)\b",
+    r"\b(cfo[-_\s]?approved|treat\s+this\s+request\s+as\s+.*approved)\b",
+    r"\b(approve\s+(it|this)?\s*immediately|auto[-_\s]?approve)\b",
     r"\b(system\s+prompt|developer\s+mode|jailbreak|reveal\s+.*prompt)\b",
-    r"\b(you\s+are\s+now|act\s+as\b)",
     r"\b(override\s+(policy|procurement|rules|controls))\b",
-    r"\b(disregard\s+(policy|rules|security|guidelines))\b",
-    r"\b(skip\s+(security|finance|legal|procurement|approval|review))\b",
 ]
 
 SENSITIVE_DATA_KEYWORDS = {
@@ -30,6 +33,28 @@ SENSITIVE_DATA_KEYWORDS = {
     "customer_pii",
     "credentials",
     "secrets",
+    "api_keys",
+    "tokens",
+    "password",
+    "passwords",
+}
+
+SENSITIVE_DATA_TOKENS = {
+    "source", "code", "source_code",
+    "production", "telemetry", "production_telemetry",
+    "confidential", "confidential_documents",
+    "pii", "employee_pii", "customer_pii",
+    "credentials", "credential",
+    "secrets", "secret",
+    "keys", "key", "api_keys", "apikey", "apikeys",
+    "tokens", "token",
+    "password", "passwords",
+}
+
+SENSITIVE_INTEGRATION_TOKENS = {
+    "git", "github", "gitlab", "bitbucket",
+    "repository", "repositories", "repo", "repos",
+    "production", "cloud", "aws", "gcp", "azure",
 }
 
 
@@ -40,6 +65,7 @@ class PolicyEvaluationResult(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     human_review_required: bool = True
     review_level: str = "business_approval"
+    recommendation_category: str = "proceed"
     deterministic_recommendation: str = ""
     deterministic_next_step: str = ""
 
@@ -49,6 +75,14 @@ def _normalize_text(text: str | None) -> str:
         return ""
     normalized = unicodedata.normalize("NFKD", str(text))
     return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
+def _tokenize_string(val: str | None) -> set[str]:
+    if not val:
+        return set()
+    cleaned = _normalize_text(val)
+    parts = re.split(r"[_\s\-/,\.;:]+", cleaned)
+    return {p.strip() for p in parts if p.strip()}
 
 
 def detect_prompt_injection(text: str | None) -> bool:
@@ -87,24 +121,21 @@ def is_date_expired(review_date_str: str | None, reference_date: date = REFERENC
 
 
 def _has_sensitive_data_access(data_access_level: str) -> tuple[bool, list[str]]:
-    norm = _normalize_text(data_access_level)
-    matched = []
+    tokens = _tokenize_string(data_access_level)
+    matched = list(tokens.intersection(SENSITIVE_DATA_TOKENS))
+    # Also check full string normalized against keywords
+    norm = _normalize_text(data_access_level).replace(" ", "_")
     for kw in SENSITIVE_DATA_KEYWORDS:
-        pattern = r"\b" + re.escape(kw.replace("_", " ")) + r"\b|\b" + re.escape(kw) + r"\b"
-        if re.search(pattern, norm):
+        if kw == norm and kw not in matched:
             matched.append(kw)
-    return bool(matched), matched
+    return bool(matched), sorted(matched)
 
 
 def _has_sensitive_integrations(integrations: list[str]) -> tuple[bool, list[str]]:
     matched = []
-    sensitive_integration_pattern = re.compile(
-        r"\b(git|github|gitlab|bitbucket|repository|repositories|production|cloud|aws|gcp|azure)\b",
-        re.IGNORECASE,
-    )
     for item in integrations:
-        clean_item = _normalize_text(item)
-        if sensitive_integration_pattern.search(clean_item):
+        tokens = _tokenize_string(item)
+        if tokens.intersection(SENSITIVE_INTEGRATION_TOKENS):
             matched.append(item)
     return bool(matched), matched
 
@@ -127,6 +158,8 @@ def evaluate_procurement_policy(
         ("request.business_justification", request.get("business_justification")),
         ("request.product_name", request.get("product_name")),
         ("request.vendor_name", request.get("vendor_name")),
+        ("request.vendor_notes", request.get("vendor_notes")),
+        ("request.api_notes", request.get("api_notes")),
     ]
     if vendor_info:
         if vendor_info.get("registry_info"):
@@ -482,6 +515,17 @@ def evaluate_procurement_policy(
         rec += " (prompt injection flagged for security review)"
         next_step += " Alert Security of detected prompt injection directive."
 
+    if "prompt_injection_detected" in risk_flags or "budget_insufficient" in risk_flags or "vendor_risk_unavailable" in risk_flags:
+        recommendation_category = "escalate"
+    elif missing_info:
+        recommendation_category = "clarify"
+    elif "existing_tool_overlap" in risk_flags:
+        recommendation_category = "evaluate_alternatives"
+    elif any(f in risk_flags for f in ("security_review_required", "privacy_review_required", "legal_review_required", "vendor_review_expired", "conflicting_vendor_evidence")):
+        recommendation_category = "specialist_review"
+    else:
+        recommendation_category = "proceed"
+
     return PolicyEvaluationResult(
         required_approvals=approvals,
         risk_flags=risk_flags,
@@ -489,6 +533,7 @@ def evaluate_procurement_policy(
         evidence=evidence_items,
         human_review_required=True,
         review_level=review_level,
+        recommendation_category=recommendation_category,
         deterministic_recommendation=rec,
         deterministic_next_step=next_step,
     )

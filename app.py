@@ -210,6 +210,12 @@ def render_decision_view(decision: ProcurementDecision, latency_ms: float, title
     # Recommendation & Next step callouts
     st.markdown(f"### **Recommendation:** {decision.recommendation}")
     st.info(f"👉 **Action Plan:** {decision.next_step}")
+    if getattr(decision, "rationale", None):
+        st.markdown(f"📝 **Rationale:** {decision.rationale}")
+    if getattr(decision, "clarifying_questions", None):
+        with st.expander("❓ Clarifying Questions for Requester", expanded=True):
+            for q in decision.clarifying_questions:
+                st.markdown(f"• {q}")
 
     # Approvals, Risk Flags, Missing Information
     col_a, col_r, col_m = st.columns(3)

@@ -16,7 +16,8 @@
       ],
       "max_missing_information": 0,
       "min_evidence_items": 2,
-      "human_review_required": true
+      "human_review_required": true,
+      "expected_recommendation_category": "proceed"
     }
   },
   {
@@ -54,7 +55,8 @@
         ]
       ],
       "min_evidence_items": 4,
-      "human_review_required": true
+      "human_review_required": true,
+      "expected_recommendation_category": "evaluate_alternatives"
     }
   },
   {
@@ -84,7 +86,8 @@
         ]
       ],
       "min_evidence_items": 3,
-      "human_review_required": true
+      "human_review_required": true,
+      "expected_recommendation_category": "specialist_review"
     }
   },
   {
@@ -126,7 +129,8 @@
         ]
       ],
       "min_evidence_items": 4,
-      "human_review_required": true
+      "human_review_required": true,
+      "expected_recommendation_category": "escalate"
     }
   },
   {
@@ -163,7 +167,8 @@
         ]
       ],
       "min_evidence_items": 1,
-      "human_review_required": true
+      "human_review_required": true,
+      "expected_recommendation_category": "escalate"
     }
   },
   {
@@ -196,7 +201,8 @@
         ]
       ],
       "min_evidence_items": 2,
-      "human_review_required": true
+      "human_review_required": true,
+      "expected_recommendation_category": "escalate"
     }
   }
 ]

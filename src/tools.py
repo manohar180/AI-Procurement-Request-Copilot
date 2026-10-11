@@ -101,6 +101,7 @@ class SoftwareCatalogLookupTool:
         product_name: str,
         category: str = "",
         vendor_name: str = "",
+        user_count: int | None = None,
         telemetry: RunTelemetryCounter | None = None,
     ) -> dict[str, Any]:
         if telemetry:
@@ -129,7 +130,7 @@ class SoftwareCatalogLookupTool:
 
         # Check if the request is an add-on or license expansion of an already approved tool
         is_expansion_kw = bool(
-            re.search(r"\b(add[_\s-]?on|expansion|training\s+pack|licenses?|seats?)\b", prod_norm)
+            re.search(r"\b(add[_\s-]?on|expansion|training\s+pack|additional\s+seats?|extra\s+seats?)\b", prod_norm)
         )
 
         exact_matches = []
@@ -163,7 +164,7 @@ class SoftwareCatalogLookupTool:
         has_overlap = False
         overlapping_tools: list[dict] = []
 
-        # If it's an add-on/expansion for an approved existing vendor/tool:
+        # 1. If it's a true add-on/expansion for an approved existing vendor/tool:
         if (vendor_matches or exact_matches) and is_expansion_kw:
             is_expansion = True
             base_tool = (exact_matches or vendor_matches)[0]
@@ -179,6 +180,28 @@ class SoftwareCatalogLookupTool:
                 )
             )
             overlapping_tools = [base_tool]
+        elif any(str(item.get("scope", "")).lower() == "company-wide" and cat_norm == str(item.get("category", "")).lower() for item in (exact_matches + vendor_matches + category_matches)):
+            # Company-wide catalog tool already deployed in same category (e.g. TaskFlow Pro when TaskFlow exists)
+            has_overlap = True
+            cw_matches = [
+                item for item in (exact_matches + vendor_matches + category_matches)
+                if str(item.get("scope", "")).lower() == "company-wide" and cat_norm == str(item.get("category", "")).lower()
+            ]
+            m = cw_matches[0]
+            seats_str = f"{m.get('licensed_seats')} licensed seats" if m.get("licensed_seats") else "active license"
+            req_seats = f"{user_count} seats" if user_count is not None else "requested deployment"
+            evidence_items.append(
+                EvidenceItem(
+                    source=self.name,
+                    finding=(
+                        f"Existing company-wide software '{m['product_name']}' ({m['software_id']}, {seats_str}) "
+                        f"already active in category '{m.get('category')}'. Requested {req_seats} should be reviewed for "
+                        f"unused company-wide capacity or credible gap documented per policy §3."
+                    ),
+                    reference=f"data/software_catalog.csv:{m['software_id']}",
+                )
+            )
+            overlapping_tools = cw_matches
         elif exact_matches:
             # Exact duplicate of existing tool
             has_overlap = True

@@ -64,13 +64,44 @@ class LLMGuardrailsAndArchitectureTests(unittest.TestCase):
         self.assertIn("Security", decision.required_approvals)
         self.assertNotIn("Auto-approve", decision.recommendation)
 
+    def test_mock_llm_waive_approval_rejected(self):
+        def waive_mock(system: str, user: str) -> str:
+            return json.dumps({
+                "recommendation": "Waive review and proceed to purchase immediately",
+                "rationale": "High priority request.",
+                "credible_gap_assessment": "",
+                "clarifying_questions": [],
+                "next_step": "Buy software.",
+            })
+
+        agent = SingleProcurementAgent(llm_client=LLMClient(mock_handler=waive_mock))
+        req = get_request("REQ-1002")
+        decision = agent.process_request(req)
+        self.assertTrue(decision.telemetry.llm_fallback_used)
+
+    def test_mock_llm_missing_top_reviewer_rejected(self):
+        # REQ-1002 requires Security and Legal; if LLM output mentions neither, guardrail rejects it
+        def omit_reviewer_mock(system: str, user: str) -> str:
+            return json.dumps({
+                "recommendation": "Send to general department head queue",
+                "rationale": "Standard processing.",
+                "credible_gap_assessment": "",
+                "clarifying_questions": ["What is the project deadline?"],
+                "next_step": "Forward to manager.",
+            })
+
+        agent = SingleProcurementAgent(llm_client=LLMClient(mock_handler=omit_reviewer_mock))
+        req = get_request("REQ-1002")
+        decision = agent.process_request(req)
+        self.assertTrue(decision.telemetry.llm_fallback_used)
+
     def test_staged_architecture_mock_llm(self):
         def staged_mock(system: str, user: str) -> str:
             if "Reviewer" in system:
                 return json.dumps({
-                    "recommendation": "Route to Security and Department Head for squad expansion",
+                    "recommendation": "Route to Security, Finance, and Department Head for squad expansion",
                     "rationale": "Source code access requires repository control verification.",
-                    "additional_risk_flags": ["source_code_audit_needed"],
+                    "additional_risk_flags": ["source_code_audit_needed", "security_review_required"],
                     "clarifying_questions": [],
                     "next_step": "Submit repository controls audit to Security.",
                 })
@@ -89,7 +120,9 @@ class LLMGuardrailsAndArchitectureTests(unittest.TestCase):
 
         self.assertFalse(decision.telemetry.llm_fallback_used)
         self.assertEqual(decision.telemetry.llm_calls, 2)
-        self.assertIn("source_code_audit_needed", decision.risk_flags)
+        # Allowed flag is kept; unapproved taxonomy flag is dropped
+        self.assertIn("security_review_required", decision.risk_flags)
+        self.assertNotIn("source_code_audit_needed", decision.risk_flags)
 
     def test_contract_equivalence_between_single_and_staged(self):
         agent_a = SingleProcurementAgent()
@@ -112,8 +145,9 @@ class LLMGuardrailsAndArchitectureTests(unittest.TestCase):
         for case in cases[:5]:
             req = get_request(case["request_id"])
             decision = agent.process_request(req)
-            is_grounded, issues = check_evidence_groundedness(decision.evidence)
+            is_grounded, issues, pct = check_evidence_groundedness(decision.evidence, case_context=json.dumps(req))
             self.assertTrue(is_grounded, f"Groundedness issues in {case['request_id']}: {issues}")
+            self.assertEqual(pct, 100.0)
 
 
 if __name__ == "__main__":
